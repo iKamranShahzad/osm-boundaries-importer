@@ -5,6 +5,7 @@ const { Database, aql } = require('arangojs');
  * - Uses level-by-level fetching with geographic containment (like Script 1)
  * - Maintains robust infrastructure and error handling (from Script 2)
  * - Guarantees accurate parent-child relationships through map_to_area
+ * - SKIPS countries that have already been processed
  */
 
 // ============================================================================
@@ -31,6 +32,8 @@ const Config = {
     batchSize: 1000,
     maxAdminLevel: 10, // Maximum admin level to fetch
     startAdminLevel: 2, // Start from country level
+    skipProcessedCountries: true, // Skip countries that have been processed
+    minBoundariesThreshold: 1, // Minimum boundaries to consider country as processed
   },
 
   collections: {
@@ -163,6 +166,58 @@ class DatabaseService {
     }
     this.collections[name] = collection;
     return collection;
+  }
+
+  /**
+   * Check if a country has already been processed
+   */
+  async isCountryProcessed(countryId) {
+    try {
+      const boundariesCol =
+        this.collections[Config.collections.ADMIN_BOUNDARIES];
+      const cursor = await this.db.query(aql`
+        FOR doc IN ${boundariesCol}
+        FILTER doc.countryId == ${countryId}
+        COLLECT WITH COUNT INTO length
+        RETURN length
+      `);
+
+      const count = await cursor.next();
+      return count >= Config.processing.minBoundariesThreshold;
+    } catch (err) {
+      console.error(`Error checking if country is processed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Get statistics for a processed country
+   */
+  async getCountryStats(countryId) {
+    try {
+      const boundariesCol =
+        this.collections[Config.collections.ADMIN_BOUNDARIES];
+      const cursor = await this.db.query(aql`
+        FOR doc IN ${boundariesCol}
+        FILTER doc.countryId == ${countryId}
+        COLLECT admin_level = doc.admin_level WITH COUNT INTO count
+        RETURN { admin_level, count }
+      `);
+
+      const levelStats = await cursor.all();
+      const stats = {};
+      let total = 0;
+
+      for (const stat of levelStats) {
+        stats[stat.admin_level] = stat.count;
+        total += stat.count;
+      }
+
+      return { total, levelStats: stats };
+    } catch (err) {
+      console.error(`Error getting country stats: ${err.message}`);
+      return { total: 0, levelStats: {} };
+    }
   }
 
   async disconnect() {
@@ -338,7 +393,7 @@ class IterativeProcessor {
   /**
    * Process country iteratively, level by level
    */
-  async processCountry(country) {
+  async processCountry(country, forceReprocess = false) {
     console.log(`\n${'='.repeat(80)}`);
     console.log(`📍 Processing: ${country.name} (${country.iso2 || 'N/A'})`);
     console.log(`${'='.repeat(80)}`);
@@ -350,10 +405,53 @@ class IterativeProcessor {
       relationships: 0,
       levelStats: {},
       errors: [],
+      skipped: false,
       startTime: Date.now(),
     };
 
     try {
+      // Check if country has already been processed
+      const isProcessed = await this.db.isCountryProcessed(
+        country.countryId || country._id,
+      );
+
+      if (
+        isProcessed &&
+        !forceReprocess &&
+        this.config.processing.skipProcessedCountries
+      ) {
+        const existingStats = await this.db.getCountryStats(
+          country.countryId || country._id,
+        );
+        console.log(`⏭️  Skipping ${country.name} - already processed`);
+        console.log(`   Existing boundaries: ${existingStats.total}`);
+
+        if (
+          existingStats.levelStats &&
+          Object.keys(existingStats.levelStats).length > 0
+        ) {
+          console.log(`   By level:`);
+          Object.entries(existingStats.levelStats)
+            .sort(([a], [b]) => parseInt(a) - parseInt(b))
+            .forEach(([level, count]) => {
+              const name =
+                ADMIN_LEVEL_METADATA[level]?.name || `Level ${level}`;
+              console.log(`     - ${name} (${level}): ${count}`);
+            });
+        }
+
+        stats.skipped = true;
+        stats.boundaries = existingStats.total;
+        stats.levelStats = existingStats.levelStats;
+        return stats;
+      }
+
+      if (isProcessed && forceReprocess) {
+        console.log(
+          `🔄 Force reprocessing ${country.name} (existing data will be updated)`,
+        );
+      }
+
       // Clear processed boundaries for new country
       this.processedBoundaries.clear();
 
@@ -676,7 +774,13 @@ class BoundaryImporter {
     this.statistics = {
       startTime: Date.now(),
       countries: [],
-      totals: { boundaries: 0, relationships: 0, errors: 0 },
+      totals: {
+        boundaries: 0,
+        relationships: 0,
+        errors: 0,
+        processed: 0,
+        skipped: 0,
+      },
     };
   }
 
@@ -684,6 +788,11 @@ class BoundaryImporter {
     console.log('🚀 Initializing Iterative Administrative Boundaries Importer');
     console.log('='.repeat(80));
     console.log('📝 Using level-by-level fetching with geographic containment');
+    console.log(
+      `📋 Skip processed countries: ${
+        Config.processing.skipProcessedCountries ? 'YES' : 'NO'
+      }`,
+    );
     console.log('='.repeat(80));
 
     this.db = await new DatabaseService(Config).connect();
@@ -697,28 +806,34 @@ class BoundaryImporter {
     let query;
 
     if (countryFilter && countryFilter.length > 0) {
+      // Check for special flags
+      const forceFlag = countryFilter.includes('--force');
+      const actualFilter = countryFilter.filter((f) => f !== '--force');
+
       // Support both ISO2 codes and country IDs
-      const isCountryId = countryFilter.some((f) => f.includes('/'));
+      const isCountryId = actualFilter.some((f) => f.includes('/'));
       if (isCountryId) {
         query = aql`
           FOR country IN countryMetadata
-          FILTER country._id IN ${countryFilter}
+          FILTER country._id IN ${actualFilter}
           RETURN { 
             _key: country._key, 
             name: country.name, 
             iso2: country.iso2, 
-            countryId: country._id 
+            countryId: country._id,
+            forceReprocess: ${forceFlag}
           }
         `;
       } else {
         query = aql`
           FOR country IN countryMetadata
-          FILTER country.iso2 IN ${countryFilter} OR country.name IN ${countryFilter}
+          FILTER country.iso2 IN ${actualFilter} OR country.name IN ${actualFilter}
           RETURN { 
             _key: country._key, 
             name: country.name, 
             iso2: country.iso2, 
-            countryId: country._id 
+            countryId: country._id,
+            forceReprocess: ${forceFlag}
           }
         `;
       }
@@ -729,7 +844,8 @@ class BoundaryImporter {
           _key: country._key, 
           name: country.name, 
           iso2: country.iso2, 
-          countryId: country._id 
+          countryId: country._id,
+          forceReprocess: false
         }
       `;
     }
@@ -750,22 +866,53 @@ class BoundaryImporter {
         return;
       }
 
+      // Check how many countries are already processed
+      let alreadyProcessed = 0;
+      for (const country of countries) {
+        const isProcessed = await this.db.isCountryProcessed(country.countryId);
+        if (isProcessed && !country.forceReprocess) {
+          alreadyProcessed++;
+        }
+      }
+
+      if (alreadyProcessed > 0) {
+        console.log(
+          `ℹ️  ${alreadyProcessed} countries already processed (will be skipped)`,
+        );
+        console.log(
+          `   Use --force flag to reprocess: node script.js US --force`,
+        );
+      }
+
       for (const country of countries) {
         if (!country.iso2) {
           console.log(`⚠️  Skipping ${country.name} - no ISO2 code`);
           continue;
         }
 
-        const result = await this.processor.processCountry(country);
+        const result = await this.processor.processCountry(
+          country,
+          country.forceReprocess,
+        );
         this.statistics.countries.push(result);
+
+        if (result.skipped) {
+          this.statistics.totals.skipped++;
+        } else {
+          this.statistics.totals.processed++;
+        }
+
         this.statistics.totals.boundaries += result.boundaries;
         this.statistics.totals.relationships += result.relationships;
         if (result.errors.length > 0) {
           this.statistics.totals.errors += result.errors.length;
         }
 
-        // Pause between countries to avoid rate limits
-        if (countries.indexOf(country) < countries.length - 1) {
+        // Pause between countries to avoid rate limits (but not for skipped countries)
+        if (
+          !result.skipped &&
+          countries.indexOf(country) < countries.length - 1
+        ) {
           console.log(
             '\n⏳ Waiting before next country (rate limit protection)...',
           );
@@ -788,7 +935,9 @@ class BoundaryImporter {
     console.log('\n' + '='.repeat(80));
     console.log('✨ IMPORT COMPLETED');
     console.log('='.repeat(80));
-    console.log(`   Countries processed: ${this.statistics.countries.length}`);
+    console.log(`   Countries checked: ${this.statistics.countries.length}`);
+    console.log(`   Countries processed: ${this.statistics.totals.processed}`);
+    console.log(`   Countries skipped: ${this.statistics.totals.skipped}`);
     console.log(`   Total boundaries: ${this.statistics.totals.boundaries}`);
     console.log(
       `   Total relationships: ${this.statistics.totals.relationships}`,
@@ -796,25 +945,42 @@ class BoundaryImporter {
     console.log(`   Total errors: ${this.statistics.totals.errors}`);
     console.log(`   Duration: ${Math.floor(duration / 60)}m ${duration % 60}s`);
 
-    for (const c of this.statistics.countries) {
-      const time = Math.round(c.duration / 1000);
-      console.log(`\n   ${c.name} (${c.iso2 || 'N/A'}):`);
-      console.log(`     • Boundaries: ${c.boundaries}`);
-      console.log(`     • Relationships: ${c.relationships}`);
+    // Separate processed and skipped countries
+    const processed = this.statistics.countries.filter((c) => !c.skipped);
+    const skipped = this.statistics.countries.filter((c) => c.skipped);
 
-      if (c.levelStats && Object.keys(c.levelStats).length > 0) {
-        console.log(`     • By level:`);
-        Object.entries(c.levelStats)
-          .sort(([a], [b]) => parseInt(a) - parseInt(b))
-          .forEach(([level, count]) => {
-            const name = ADMIN_LEVEL_METADATA[level]?.name || `Level ${level}`;
-            console.log(`        - ${name} (${level}): ${count}`);
-          });
+    if (processed.length > 0) {
+      console.log('\n📊 PROCESSED COUNTRIES:');
+      for (const c of processed) {
+        const time = Math.round(c.duration / 1000);
+        console.log(`\n   ${c.name} (${c.iso2 || 'N/A'}):`);
+        console.log(`     • Boundaries: ${c.boundaries}`);
+        console.log(`     • Relationships: ${c.relationships}`);
+
+        if (c.levelStats && Object.keys(c.levelStats).length > 0) {
+          console.log(`     • By level:`);
+          Object.entries(c.levelStats)
+            .sort(([a], [b]) => parseInt(a) - parseInt(b))
+            .forEach(([level, count]) => {
+              const name =
+                ADMIN_LEVEL_METADATA[level]?.name || `Level ${level}`;
+              console.log(`        - ${name} (${level}): ${count}`);
+            });
+        }
+
+        console.log(`     • Time: ${time}s`);
+        if (c.errors && c.errors.length) {
+          console.log(`     • Errors: ${c.errors.join('; ')}`);
+        }
       }
+    }
 
-      console.log(`     • Time: ${time}s`);
-      if (c.errors && c.errors.length) {
-        console.log(`     • Errors: ${c.errors.join('; ')}`);
+    if (skipped.length > 0) {
+      console.log('\n⏭️  SKIPPED COUNTRIES (Already Processed):');
+      for (const c of skipped) {
+        console.log(
+          `   • ${c.name} (${c.iso2 || 'N/A'}): ${c.boundaries} boundaries`,
+        );
       }
     }
   }
@@ -834,8 +1000,25 @@ if (require.main === module) {
   const importer = new BoundaryImporter();
   const args = process.argv.slice(2);
 
-  // Can pass country IDs like: "countryMetadata/5253251"
-  // Or ISO2 codes like: "US", "GB", "PK"
+  // Usage examples:
+  // Process all unprocessed countries: node script.js
+  // Process specific countries: node script.js US GB PK
+  // Force reprocess: node script.js US --force
+  // Process by country IDs: node script.js "countryMetadata/5253251"
+
+  console.log('\n📖 Usage:');
+  console.log(
+    '   node script.js                    # Process all unprocessed countries',
+  );
+  console.log(
+    '   node script.js US GB              # Process specific countries by ISO2',
+  );
+  console.log(
+    '   node script.js US --force         # Force reprocess even if already done',
+  );
+  console.log(
+    '   node script.js countryMetadata/123 # Process by country ID\n',
+  );
 
   importer
     .run(args.length ? args : null)
