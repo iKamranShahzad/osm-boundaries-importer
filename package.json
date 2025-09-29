@@ -1,0 +1,17 @@
+{
+  "name": "osmdata",
+  "version": "1.0.0",
+  "description": "",
+  "main": "osm.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "arangojs": "^10.1.2",
+    "node-fetch": "^3.3.2"
+  }
+}
